@@ -1,0 +1,43 @@
+AWS Observability Access Manager (OAM) enables you to securely share and access telemetry data—such as logs and metrics—across AWS accounts and organizational units without duplicating data. When you transfer logs and metrics from one AWS account to another using OAM, it's important to understand where the data is stored and how pricing is calculated.
+
+Data Storage Location
+Source Account Storage: The logs and metrics remain stored in the source account where they were originally collected. There is no duplication of data in the destination or monitoring account.
+
+Access via OAM: The destination account accesses this telemetry data through cross-account links established by OAM. This means the data is not physically transferred or copied to the destination account; instead, permissions are set to allow access.
+
+Pricing and Costs
+Data Storage Charges: You are billed for the storage of logs and metrics in the source account. This follows the standard pricing for AWS services like Amazon CloudWatch Logs and Metrics.
+
+Data Retrieval Charges: When the destination account accesses the data, any retrieval fees are charged to the source account. This includes API requests and any associated costs for querying the data.
+
+OAM Charges: There are no additional charges specifically for using AWS OAM. The service itself is free, but you incur costs based on the underlying services (e.g., CloudWatch) and data retrieval.
+
+Data Transfer Fees: Generally, there are no data transfer charges for accessing logs and metrics across accounts within the same AWS Region. However, if data is accessed across different regions, standard AWS inter-region data transfer rates apply.
+
+Monitoring Account Costs: The destination or monitoring account does not incur storage costs for the accessed data since it is not storing any copies. Any costs would be minimal, associated only with the API calls made to access the data.
+
+Disk Size and Storage Considerations
+Disk Size in Source Account: The "disk size" (i.e., the amount of storage used) for logs and metrics is only impacted in the source account. The destination account does not use additional storage for this data.
+
+Retention Policies: You can manage storage costs by setting appropriate retention policies for your logs and metrics in the source account.
+
+Example Scenario
+Suppose Account A is generating logs and metrics, and Account B wants to access this data:
+
+Storage Costs: Account A pays for the storage of its logs and metrics.
+Access Costs: When Account B accesses the data, any API call costs are billed to Account A.
+No Duplication: Account B does not store the data, so there are no storage costs for Account B related to this data.
+Recommendations
+Monitor Usage: Keep an eye on the storage and retrieval costs in the source account to manage your expenses effectively.
+
+Optimize Data: Implement data compression and efficient logging practices to reduce the amount of data stored.
+
+Set Retention Policies: Define how long you need to keep logs and metrics to avoid unnecessary storage costs.
+
+Conclusion
+When using AWS OAM to access logs and metrics across accounts:
+
+Data remains in the source account, and storage costs are incurred there.
+Pricing is based on standard AWS service charges for storage and retrieval in the source account.
+No additional storage costs are incurred in the destination account accessing the data.
+By understanding these aspects, you can effectively manage your observability data across AWS accounts while keeping costs under control.
