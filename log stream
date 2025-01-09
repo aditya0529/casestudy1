@@ -1,0 +1,189 @@
+import json
+import boto3
+import re
+import datetime
+from botocore.exceptions import ClientError
+
+codepipeline_client = boto3.client('codepipeline')
+codebuild_client = boto3.client('codebuild')
+logs_client = boto3.client('logs')
+
+def lambda_handler(event, context):
+    """
+    1) Log the entire event for troubleshooting.
+    2) Parse the pipeline name, execution-id, stage, and state from the event detail.
+    3) If the stage is FAILED, call list_action_executions for this pipelineExecutionId.
+    4) For each action, log details (including logStreamARN, externalExecutionId, etc.).
+    5) Filter for CodeBuild actions that are 'Failed'.
+    6) Attempt to parse logStreamARN from executionResult first.
+       If not present, fallback to externalExecutionId for codebuild:BatchGetBuilds.
+    7) Check logs for "Rate exceeded"; if found, retry the pipeline stage.
+    """
+
+    # 1) Log the raw event
+    print("Received event:", json.dumps(event))
+
+    detail = event.get("detail", {})
+    pipeline_name = detail.get("pipeline")
+    execution_id  = detail.get("execution-id")  # note the dash in "execution-id"
+    stage_name    = detail.get("stage")
+    state         = detail.get("state")
+
+    print(f"[INFO] Parsed => pipeline={pipeline_name}, execution_id={execution_id}, stage={stage_name}, state={state}")
+
+    # 2) If the stage did not fail, no action needed
+    if state != "FAILED":
+        print("[INFO] Stage is not FAILED. Exiting.")
+        return
+
+    # 3) Validate necessary fields
+    if not pipeline_name or not execution_id:
+        print("[ERROR] Missing pipeline_name or execution-id in the event. Exiting.")
+        return
+
+    # 4) Retrieve action executions for this pipeline execution
+    try:
+        resp = codepipeline_client.list_action_executions(
+            pipelineName=pipeline_name,
+            filter={"pipelineExecutionId": execution_id}
+        )
+        action_executions = resp.get("actionExecutionDetails", [])
+        print(f"[INFO] Retrieved {len(action_executions)} action execution(s).")
+    except Exception as e:
+        print(f"[ERROR] list_action_executions failed: {e}")
+        return
+
+    # 5) Log details for each action (match the structure from the sample JSON)
+    for action_detail in action_executions:
+        action_name = action_detail.get("actionName")
+        status      = action_detail.get("status")
+
+        # Category, provider in actionDetail["input"]["actionTypeId"]
+        input_info       = action_detail.get("input", {})
+        action_type_id   = input_info.get("actionTypeId", {})
+        category         = action_type_id.get("category")
+        provider         = action_type_id.get("provider")
+
+        # externalExecutionId, logStreamARN in actionDetail["output"]["executionResult"]
+        output_info      = action_detail.get("output", {})
+        execution_result = output_info.get("executionResult", {})
+        ext_id           = execution_result.get("externalExecutionId")
+        log_stream_arn   = execution_result.get("logStreamARN")
+
+        print(
+            f"[DEBUG] stageName={action_detail.get('stageName')}, "
+            f"actionName={action_name}, status={status}, "
+            f"category={category}, provider={provider}, "
+            f"externalExecutionId={ext_id}, logStreamARN={log_stream_arn}"
+        )
+
+    # 6) Identify failed CodeBuild actions
+    failed_codebuild_actions = []
+    for action_detail in action_executions:
+        if action_detail.get("status") == "Failed":
+            input_info       = action_detail.get("input", {})
+            action_type_id   = input_info.get("actionTypeId", {})
+            category         = action_type_id.get("category")
+            provider         = action_type_id.get("provider")
+
+            if category == "Build" and provider == "CodeBuild":
+                failed_codebuild_actions.append(action_detail)
+
+    if not failed_codebuild_actions:
+        print("[INFO] No failed CodeBuild actions. Exiting.")
+        return
+
+    # 7) For each failed CodeBuild action, check logs for "Rate exceeded"
+    for failed_action in failed_codebuild_actions:
+        output_info      = failed_action.get("output", {})
+        execution_result = output_info.get("executionResult", {})
+        log_stream_arn   = execution_result.get("logStreamARN")
+        build_arn        = execution_result.get("externalExecutionId")
+
+        # First, try logStreamARN approach:
+        if log_stream_arn:
+            print(f"[INFO] Found logStreamARN: {log_stream_arn}")
+            log_group_name, log_stream_name = parse_log_stream_arn(log_stream_arn)
+            if not log_group_name or not log_stream_name:
+                print("[WARN] Could not parse logStreamARN. Fallback to externalExecutionId if available.")
+            else:
+                # We have a parsed log group and stream, so check logs:
+                if check_for_rate_exceeded(log_group_name, log_stream_name):
+                    retry_stage(pipeline_name, execution_id, stage_name)
+                else:
+                    print("[INFO] 'Rate exceeded' not found in logs for this build.")
+                continue  # done with this action; proceed to next
+
+        # If no logStreamARN (or parse failed), fallback to externalExecutionId
+        if build_arn:
+            print("[INFO] No valid logStreamARN; using build ARN:", build_arn)
+            try:
+                build_info = get_codebuild_info(build_arn)
+                if not build_info:
+                    print("[WARN] No build info found for ARN:", build_arn)
+                    continue
+
+                logs_info = build_info.get("logs", {})
+                log_group_name  = logs_info.get("groupName")
+                log_stream_name = logs_info.get("streamName")
+
+                if log_group_name and log_stream_name:
+                    print(f"[INFO] Checking logs in group={log_group_name}, stream={log_stream_name}")
+                    if check_for_rate_exceeded(log_group_name, log_stream_name):
+                        retry_stage(pipeline_name, execution_id, stage_name)
+                    else:
+                        print("[INFO] 'Rate exceeded' not found in logs.")
+                else:
+                    print("[WARN] No log group/stream for this CodeBuild run. Skipping.")
+            except Exception as e:
+                print(f"[ERROR] While fetching CodeBuild info or logs: {e}")
+        else:
+            print("[WARN] No logStreamARN and no externalExecutionId for this failed action. Cannot check logs.")
+
+
+def parse_log_stream_arn(arn):
+    """
+    Given a logStreamARN like:
+      arn:aws:logs:us-east-1:111111111111:log-group:/aws/codebuild/my-build-project:log-stream:my-build-project/xyz123
+    Parse out the log group name (e.g. /aws/codebuild/my-build-project)
+    and log stream name (e.g. my-build-project/xyz123).
+    Return (logGroupName, logStreamName), or (None, None) if parse fails.
+    """
+    try:
+        # Example ARN format has 6 or 7 segments after splitting on ':'
+        # We'll remove the first 5 (arn, aws, logs, region, account)
+        # The remainder might look like: "log-group:/aws/codebuild/my-build-project:log-stream:my-build-project/xyz123"
+        parts = arn.split(":")
+        resource_part = ":".join(parts[5:])  
+        # e.g. "log-group:/aws/codebuild/my-build-project:log-stream:my-build-project/xyz123"
+
+        resource_parts = resource_part.split(":")
+        # e.g. ["log-group", "/aws/codebuild/my-build-project", "log-stream", "my-build-project/xyz123"]
+
+        if len(resource_parts) < 4:
+            print("[ERROR] Unexpected logStreamARN format:", arn)
+            return None, None
+
+        # logGroupName is resource_parts[1], logStreamName is resource_parts[3]
+        log_group_name  = resource_parts[1]
+        log_stream_name = resource_parts[3]
+        return log_group_name, log_stream_name
+    except Exception as e:
+        print(f"[ERROR] Could not parse logStreamARN='{arn}'. Error: {e}")
+        return None, None
+
+
+def get_codebuild_info(build_arn):
+    """
+    Given a CodeBuild ARN, return the first build info from batch_get_builds, 
+    or None if not found.
+    """
+    try:
+        resp = codebuild_client.batch_get_builds(ids=[build_arn])
+        builds = resp.get("builds", [])
+        if builds:
+            return builds[0]
+        return None
+    except ClientError as e:
+        print("[ERROR] batch_get_builds failed:", e)
+       
