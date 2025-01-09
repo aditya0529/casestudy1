@@ -1,255 +1,134 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Listens to FAILED CodePipeline stage events for two pipelines, checks if the
-  failed action is CodeBuild, looks for "Rate exceeded" in the build logs, and
-  retries the stage if found. Additionally logs all CodeBuild action execution
-  IDs for troubleshooting.
+import json
+import boto3
+import re
 
-Parameters:
-  PipelineNameOne:
-    Type: String
-    Description: Name of the first pipeline to watch
-  PipelineNameTwo:
-    Type: String
-    Description: Name of the second pipeline to watch
+codepipeline_client = boto3.client('codepipeline')
+codebuild_client = boto3.client('codebuild')
+logs_client = boto3.client('logs')
 
-Resources:
-  #################################
-  # 1) IAM Role for Lambda
-  #################################
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Path: "/"
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: AllowCodePipelineActions
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - codepipeline:ListActionExecutions
-                  - codepipeline:GetPipelineExecution
-                  - codepipeline:RetryStageExecution
-                Resource:
-                  - !Sub arn:aws:codepipeline:*:${AWS::AccountId}:${PipelineNameOne}
-                  - !Sub arn:aws:codepipeline:*:${AWS::AccountId}:${PipelineNameTwo}
-        - PolicyName: AllowCodeBuildActions
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - codebuild:BatchGetBuilds
-                Resource: "*"
-                # Ideally narrow to specific CodeBuild projects if known
-        - PolicyName: AllowReadCloudWatchLogs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:FilterLogEvents
-                Resource:
-                  - arn:aws:logs:*:*:log-group:/aws/codebuild/*
-                  # If you know your project names, you could narrow it further:
-                  # - arn:aws:logs:<region>:<account-id>:log-group:/aws/codebuild/<build-project-name>:*
-                  # etc.
+def lambda_handler(event, context):
+    """
+    1) Log the entire event for troubleshooting.
+    2) Parse the pipeline name, execution-id, stage, and state.
+    3) If FAILED, call list_action_executions to find CodeBuild actions.
+    4) Log every action's details (type, category, provider, externalExecutionId, status).
+    5) Filter for failed CodeBuild actions and process logs for 'Rate exceeded'.
+    """
 
-  #################################
-  # 2) Lambda Function
-  #################################
-  PipelineFailureHandlerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Handler: index.lambda_handler
-      Runtime: python3.9
-      Timeout: 90
-      Code:
-        ZipFile: |
-          import os
-          import boto3
-          import re
+    # 1) Log the raw event
+    print("Received event: " + json.dumps(event))
 
-          codepipeline_client = boto3.client('codepipeline')
-          codebuild_client = boto3.client('codebuild')
-          logs_client = boto3.client('logs')
+    detail = event.get("detail", {})
+    # For a "Stage Execution State Change" event, "execution-id" is typically the key
+    pipeline_name = detail.get("pipeline")
+    execution_id  = detail.get("execution-id")  # note the dash
+    stage_name    = detail.get("stage")
+    state         = detail.get("state")
 
-          def lambda_handler(event, context):
-              """
-              1) Confirm the pipeline stage failed.
-              2) List all action executions, logging any CodeBuild externalExecutionIds.
-              3) Identify the failing CodeBuild action(s).
-              4) Retrieve the CodeBuild build ID, query CloudWatch log stream for 'Rate exceeded'.
-              5) Retry stage if matched.
-              """
+    # Log parsed fields
+    print(f"Parsed pipeline_name={pipeline_name}, execution_id={execution_id}, stage_name={stage_name}, state={state}")
 
-              detail = event.get('detail', {})
-              state = detail.get('state')
-              pipeline_name = detail.get('pipeline')
-              execution_id = detail.get('executionId')
-              stage_name = detail.get('stage')
+    # 2) If state is not FAILED, exit
+    if state != "FAILED":
+        print("Stage is not FAILED. Nothing to do.")
+        return
 
-              print(f"Pipeline: {pipeline_name}, ExecutionID: {execution_id}, Stage: {stage_name}, State: {state}")
+    # 3) Validate we have all necessary fields
+    if not pipeline_name or not execution_id:
+        print("Missing pipeline_name or execution-id in the event detail. Exiting.")
+        return
 
-              if state != 'FAILED':
-                  print("Not a FAILED event. Exiting.")
-                  return
+    # 4) Retrieve all action executions for this pipeline execution
+    try:
+        resp = codepipeline_client.list_action_executions(
+            pipelineName=pipeline_name,
+            filter={"pipelineExecutionId": execution_id}
+        )
+        action_executions = resp.get("actionExecutionDetails", [])
+        print(f"Retrieved {len(action_executions)} action execution(s) for pipeline execution {execution_id}.")
+    except Exception as e:
+        print(f"Error calling list_action_executions: {str(e)}")
+        return
 
-              # 1. Get the pipeline execution details to find actions in this execution.
-              try:
-                  action_exec_resp = codepipeline_client.list_action_executions(
-                      pipelineName=pipeline_name,
-                      filter={'pipelineExecutionId': execution_id}
-                  )
-                  action_executions = action_exec_resp.get('actionExecutionDetails', [])
-              except Exception as e:
-                  print(f"Error retrieving action executions: {str(e)}")
-                  return
+    # 5) Log details about each action (including type, category, provider, externalExecutionId, status)
+    for action_detail in action_executions:
+        action_name  = action_detail.get("actionName")
+        action_type  = action_detail.get("actionTypeId", {})
+        category     = action_type.get("category")
+        provider     = action_type.get("provider")
+        status       = action_detail.get("status")
+        ext_id       = action_detail.get("externalExecutionId")
+        
+        print(
+            f"[DEBUG] Action Name: {action_name}, "
+            f"Category: {category}, Provider: {provider}, "
+            f"Status: {status}, externalExecutionId: {ext_id}"
+        )
 
-              # 2. Log all CodeBuild actions (for debugging/troubleshooting).
-              #    This will let you see if externalExecutionId is set for each action.
-              for action in action_executions:
-                  action_name = action.get('actionName')
-                  action_type_id = action.get('actionTypeId', {})
-                  category = action_type_id.get('category')
-                  provider = action_type_id.get('provider')
-                  external_id = action.get('externalExecutionId')
+    # 6) Identify failed CodeBuild action(s) and process logs
+    failed_codebuild_actions = []
+    for a in action_executions:
+        if a.get("status") == "Failed":
+            action_type = a.get("actionTypeId", {})
+            if action_type.get("category") == "Build" and action_type.get("provider") == "CodeBuild":
+                failed_codebuild_actions.append(a)
 
-                  # Log for ANY CodeBuild action in the pipeline.
-                  if category == 'Build' and provider == 'CodeBuild':
-                      print(f"[DEBUG] Action '{action_name}' is CodeBuild. externalExecutionId='{external_id}'")
+    if not failed_codebuild_actions:
+        print("No failed CodeBuild actions found. Exiting.")
+        return
 
-              # 3. Among the actions that failed, specifically find the CodeBuild action(s).
-              failed_codebuild_actions = []
-              for a in action_executions:
-                  if a.get('status') == 'Failed':
-                      action_type_id = a.get('actionTypeId', {})
-                      category = action_type_id.get('category')
-                      provider = action_type_id.get('provider')
-                      if category == 'Build' and provider == 'CodeBuild':
-                          failed_codebuild_actions.append(a)
+    # 7) Check each failed CodeBuild action for "Rate exceeded" in logs
+    for failed_action in failed_codebuild_actions:
+        build_arn = failed_action.get("externalExecutionId")
+        if not build_arn:
+            print("No externalExecutionId (CodeBuild ARN) found for the failed action. Skipping.")
+            continue
 
-              if not failed_codebuild_actions:
-                  print("No failed CodeBuild actions found. Exiting.")
-                  return
+        try:
+            builds_response = codebuild_client.batch_get_builds(ids=[build_arn])
+            builds = builds_response.get("builds", [])
+            if not builds:
+                print(f"No build info returned for ARN: {build_arn}. Skipping.")
+                continue
 
-              # 4. For each failed CodeBuild action, retrieve the build ID from output details.
-              for failed_action in failed_codebuild_actions:
-                  build_arn = failed_action.get('externalExecutionId')
-                  if not build_arn:
-                      print("No externalExecutionId (CodeBuild ARN) found for the failed action.")
-                      continue
+            build_info = builds[0]
+            logs_info = build_info.get("logs", {})
+            log_group_name  = logs_info.get("groupName")
+            log_stream_name = logs_info.get("streamName")
 
-                  # The CodeBuild build ID is typically the latter part of the ARN.
-                  # e.g. "arn:aws:codebuild:region:acct:build/project-name:build-id"
-                  # We can pass the entire ARN to batchGetBuilds.
-                  try:
-                      builds_response = codebuild_client.batch_get_builds(ids=[build_arn])
-                  except Exception as cbe:
-                      print(f"Error calling batch_get_builds for ARN {build_arn}: {str(cbe)}")
-                      continue
+            if not log_group_name or not log_stream_name:
+                print("No log group/stream found for this build. Skipping.")
+                continue
 
-                  builds = builds_response.get('builds', [])
-                  if not builds:
-                      print(f"No build info found for ARN: {build_arn}")
-                      continue
+            print(f"Checking logs in group={log_group_name}, stream={log_stream_name}")
+            response = logs_client.filter_log_events(
+                logGroupName=log_group_name,
+                logStreamNames=[log_stream_name],
+                filterPattern='?Rate ?exceeded',
+                limit=100
+            )
 
-                  build_info = builds[0]
-                  logs_info = build_info.get('logs', {})
-                  log_group_name = logs_info.get('groupName')
-                  log_stream_name = logs_info.get('streamName')
+            matched = False
+            for event_message in response.get("events", []):
+                message = event_message.get("message", "")
+                if re.search(r"Rate exceeded", message, re.IGNORECASE):
+                    matched = True
+                    break
 
-                  if not log_group_name or not log_stream_name:
-                      print("Cannot find log group or stream for the failed build.")
-                      continue
+            if matched:
+                print("Found 'Rate exceeded' in logs. Retrying the pipeline stage...")
+                try:
+                    retry_resp = codepipeline_client.retry_stage_execution(
+                        pipelineName=pipeline_name,
+                        pipelineExecutionId=execution_id,
+                        stageName=stage_name,
+                        retryMode='FAILED_ACTIONS'
+                    )
+                    print("Retry response:", retry_resp)
+                except Exception as re_err:
+                    print(f"Error retrying stage execution: {str(re_err)}")
+            else:
+                print("No 'Rate exceeded' error found in logs for this build.")
 
-                  print(f"[INFO] Checking logs in group={log_group_name}, stream={log_stream_name}")
-
-                  # 5. Query the log stream for "Rate exceeded"
-                  try:
-                      response = logs_client.filter_log_events(
-                          logGroupName=log_group_name,
-                          logStreamNames=[log_stream_name],
-                          filterPattern='?Rate ?exceeded',
-                          limit=100
-                      )
-                      matched = False
-                      for event_message in response.get('events', []):
-                          msg = event_message.get('message', '')
-                          if re.search(r'Rate exceeded', msg, re.IGNORECASE):
-                              matched = True
-                              break
-
-                      if matched:
-                          print("[INFO] Detected 'Rate exceeded' in build logs. Retrying stage.")
-                          try:
-                              retry_response = codepipeline_client.retry_stage_execution(
-                                  pipelineName=pipeline_name,
-                                  pipelineExecutionId=execution_id,
-                                  stageName=stage_name,
-                                  retryMode='FAILED_ACTIONS'
-                              )
-                              print("Retry response:", retry_response)
-                          except Exception as re_err:
-                              print(f"[ERROR] Error retrying stage execution: {str(re_err)}")
-                      else:
-                          print("[INFO] No 'Rate exceeded' error found in this build log.")
-
-                  except logs_client.exceptions.ResourceNotFoundException:
-                      print(f"[ERROR] Log group or stream not found: {log_group_name}/{log_stream_name}")
-                  except Exception as e:
-                      print(f"[ERROR] Error filtering logs: {str(e)}")
-
-  #################################
-  # 3) Event Rule
-  #################################
-  PipelineFailedStageEventRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Description: "Triggers Lambda when a CodePipeline stage fails for either pipeline."
-      EventPattern:
-        source:
-          - aws.codepipeline
-        detail-type:
-          - CodePipeline Stage Execution State Change
-        detail:
-          state:
-            - FAILED
-          pipeline:
-            - !Ref PipelineNameOne
-            - !Ref PipelineNameTwo
-      Targets:
-        - Arn: !GetAtt PipelineFailureHandlerFunction.Arn
-          Id: "PipelineFailureLambdaTarget"
-
-  #################################
-  # 4) Permission for Event Rule to Invoke Lambda
-  #################################
-  AllowEventRuleToInvokeLambda:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !GetAtt PipelineFailureHandlerFunction.Arn
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt PipelineFailedStageEventRule.Arn
-
-Outputs:
-  LambdaFunctionName:
-    Description: "Name of the Lambda function handling pipeline failures"
-    Value: !Ref PipelineFailureHandlerFunction
-
-  EventRuleName:
-    Description: "Name of the Event Rule that triggers the Lambda"
-    Value: !Ref PipelineFailedStageEventRule
+        except Exception as cbe:
+            print(f"Error handling CodeBuild ARN {build_arn}: {str(cbe)}")
