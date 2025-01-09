@@ -1,0 +1,156 @@
+import json
+import boto3
+import re
+
+codepipeline_client = boto3.client('codepipeline')
+codebuild_client = boto3.client('codebuild')
+logs_client = boto3.client('logs')
+
+def lambda_handler(event, context):
+    """
+    1) Log the entire event for troubleshooting.
+    2) Parse the pipeline name, execution-id, stage, and state.
+    3) If FAILED, call list_action_executions to find actions.
+    4) Log every action's details (type, category, provider, externalExecutionId, status).
+    5) Filter for failed CodeBuild actions and process logs for 'Rate exceeded'.
+    """
+
+    # 1) Log the raw event
+    print("Received event: " + json.dumps(event))
+
+    detail = event.get("detail", {})
+    # For a "Stage Execution State Change" event, "execution-id" is typically the key
+    pipeline_name = detail.get("pipeline")
+    execution_id  = detail.get("execution-id")  # note the dash
+    stage_name    = detail.get("stage")
+    state         = detail.get("state")
+
+    # Log parsed fields
+    print(f"Parsed pipeline_name={pipeline_name}, execution_id={execution_id}, stage_name={stage_name}, state={state}")
+
+    # 2) If state is not FAILED, exit
+    if state != "FAILED":
+        print("Stage is not FAILED. Nothing to do.")
+        return
+
+    # 3) Validate we have all necessary fields
+    if not pipeline_name or not execution_id:
+        print("Missing pipeline_name or execution-id in the event detail. Exiting.")
+        return
+
+    # 4) Retrieve all action executions for this pipeline execution
+    try:
+        resp = codepipeline_client.list_action_executions(
+            pipelineName=pipeline_name,
+            filter={"pipelineExecutionId": execution_id}
+        )
+        action_executions = resp.get("actionExecutionDetails", [])
+        print(f"Retrieved {len(action_executions)} action execution(s) for pipeline execution {execution_id}.")
+    except Exception as e:
+        print(f"Error calling list_action_executions: {str(e)}")
+        return
+
+    # 5) Log details about each action 
+    #    NOTE: The sample JSON structure shows that 'category' and 'provider' 
+    #    are inside actionDetail["input"]["actionTypeId"], and 'externalExecutionId' 
+    #    is inside actionDetail["output"]["executionResult"].
+    for action_detail in action_executions:
+        # Basic fields
+        action_name = action_detail.get("actionName")
+        status      = action_detail.get("status")
+
+        # Grab the input data (where category & provider live)
+        input_info       = action_detail.get("input", {})
+        action_type_id   = input_info.get("actionTypeId", {})
+        category         = action_type_id.get("category")
+        provider         = action_type_id.get("provider")
+
+        # Grab the output data (where externalExecutionId lives)
+        output_info      = action_detail.get("output", {})
+        execution_result = output_info.get("executionResult", {})
+        ext_id           = execution_result.get("externalExecutionId")
+
+        print(
+            f"[DEBUG] StageName={action_detail.get('stageName')}, "
+            f"ActionName={action_name}, Status={status}, "
+            f"Category={category}, Provider={provider}, "
+            f"externalExecutionId={ext_id}"
+        )
+
+    # 6) Identify failed CodeBuild action(s) and process logs
+    failed_codebuild_actions = []
+    for action_detail in action_executions:
+        status = action_detail.get("status")
+        if status == "Failed":
+            # Same extraction logic for category & provider
+            input_info       = action_detail.get("input", {})
+            action_type_id   = input_info.get("actionTypeId", {})
+            category         = action_type_id.get("category")
+            provider         = action_type_id.get("provider")
+
+            # If this is a CodeBuild action
+            if category == "Build" and provider == "CodeBuild":
+                failed_codebuild_actions.append(action_detail)
+
+    if not failed_codebuild_actions:
+        print("No failed CodeBuild actions found. Exiting.")
+        return
+
+    # 7) Check each failed CodeBuild action for "Rate exceeded" in logs
+    for failed_action in failed_codebuild_actions:
+        output_info      = failed_action.get("output", {})
+        execution_result = output_info.get("executionResult", {})
+        build_arn        = execution_result.get("externalExecutionId")
+
+        if not build_arn:
+            print("No externalExecutionId (CodeBuild ARN) found for the failed action. Skipping.")
+            continue
+
+        try:
+            builds_response = codebuild_client.batch_get_builds(ids=[build_arn])
+            builds = builds_response.get("builds", [])
+            if not builds:
+                print(f"No build info returned for ARN: {build_arn}. Skipping.")
+                continue
+
+            build_info = builds[0]
+            logs_info = build_info.get("logs", {})
+            log_group_name  = logs_info.get("groupName")
+            log_stream_name = logs_info.get("streamName")
+
+            if not log_group_name or not log_stream_name:
+                print("No log group/stream found for this build. Skipping.")
+                continue
+
+            print(f"Checking logs in group={log_group_name}, stream={log_stream_name}")
+            response = logs_client.filter_log_events(
+                logGroupName=log_group_name,
+                logStreamNames=[log_stream_name],
+                filterPattern='?Rate ?exceeded',
+                limit=100
+            )
+
+            matched = False
+            for event_message in response.get("events", []):
+                message = event_message.get("message", "")
+                if re.search(r"Rate exceeded", message, re.IGNORECASE):
+                    matched = True
+                    break
+
+            if matched:
+                print("Found 'Rate exceeded' in logs. Retrying the pipeline stage...")
+                try:
+                    retry_resp = codepipeline_client.retry_stage_execution(
+                        pipelineName=pipeline_name,
+                        pipelineExecutionId=execution_id,
+                        stageName=stage_name,
+                        retryMode='FAILED_ACTIONS'
+                    )
+                    print("Retry response:", retry_resp)
+                except Exception as re_err:
+                    print(f"Error retrying stage execution: {str(re_err)}")
+            else:
+                print("No 'Rate exceeded' error found in logs for this build.")
+
+        except Exception as cbe:
+            print(f"Error handling CodeBuild ARN {build_arn}: {str(cbe)}")
